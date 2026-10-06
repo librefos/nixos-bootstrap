@@ -1,0 +1,713 @@
+NixOS
+=====
+
+The configuration of one machine, the amd desktop, and everything
+needed to build it again from an empty disk.  The repository alone
+reproduces it: the partition table, the encryption, Secure Boot, the
+system and the user half, with nothing done by hand but the answers
+the runbook asks for and the secrets listed under By hand.
+
+This file describes what the machine is and why it is that way.  What
+each option does in detail is in the comments beside it; the procedure
+for installing, and for changing the installed system, is in
+install-runbook.md.
+
+system.nix           entry point: the five pins and the imports
+configuration.nix    the host: its imports and system.stateVersion
+disko.nix            the disk
+modules/             the system half, one file per concern
+  boot.nix           Secure Boot, loader, kernel, microcode, firmware
+  filesystems.nix    fstrim, scrub, I/O scheduler, snapper
+  memory-cpu.nix     zram, the reclaim sysctls, the governor
+  graphics.nix       mesa and VA-API
+  session.nix        Hyprland under uwsm, hyprlock's PAM service,
+                     foot, cursor, keymap, fonts
+  shell.nix          prompt, ed and EDITOR, no nano, ssh-agent
+  firefox.nix        Developer Edition and its policies
+  network.nix        hostname, networkd, resolved, nftables, locale
+  users.nix          accounts, sudo, the home-manager wiring
+  documentation.nix  man pages and the option manual
+  packages.nix       what has no module of its own
+  compat.nix         nix-ld, for prebuilt dynamically linked binaries
+  nix.nix            Nix settings, gc, optimise
+home/                the user half, for librefos
+  default.nix        imports and home.stateVersion
+  hyprland.nix       compositor settings, bar, lock screen, idle
+  shell.nix          bash
+  git.nix            git, GnuPG, ssh-sendmail
+  firefox.nix        the Developer Edition profile
+  emacs.nix          Emacs and Gnus
+  files/             what no option expresses: gnus.el,
+                     ssh-sendmail, and vimrc
+scripts/
+  reinstall.sh       runbook steps 2 to 10
+  apply.sh           a new commit onto the running system
+  secureboot-check.sh
+install-runbook.md   reinstalling, and changing the installed system
+README               this file
+
+hardware-configuration.nix is not in this repository.  It is generated
+on the machine, with --no-filesystems, so it carries the initrd module
+list and nothing about the mounts or the LUKS device; those come from
+disko.nix instead, and nothing is defined twice.
+
+
+The Machine
+===========
+
+Board and Firmware
+  MSI A520M-A PRO (MS-7C96), rev 1.0
+  AMI UEFI 2.70 (5.17), firmware 1.J0, 2025-04-29
+  Secure Boot: enforcing, user mode, this machine's keys only
+  Secure Boot Preset: Maximum Security, with an administrator password
+  TPM: 2.0, /dev/tpm0 and /dev/tpmrm0 present
+
+CPU
+  AMD Ryzen 7 5700G with Radeon Graphics (Cezanne, family 25)
+  8 cores, 16 threads, 1 socket
+  422 MHz to 4674 MHz, amd_pstate=active on the current cmdline
+  L1d 256K, L1i 256K, L2 4M, L3 16M
+  Relevant flags: aes, avx2, sha_ni, vaes, rdseed, smep, smap, pku,
+  umip, npt, svm (virtualisation available)
+
+Memory
+  31 GiB usable
+  zram0, 15.6 GiB, the only swap device
+
+Storage
+  nvme0n1, 931.5 GiB, Lexar SSD NM610 PRO 1TB (DRAM-less, HMB)
+  Controller: Shenzhen Longsys 1d97:1202, driver nvme
+
+Graphics and audio
+  Integrated Cezanne Radeon Vega, PCI 1002:1638, driver amdgpu
+  Display: single HDMI-1 at 1920x1080
+  HDMI/DP audio 1002:1637 and Ryzen HD Audio 1022:15e3, both
+  snd_hda_intel
+  Codec is Realtek ALC897.
+
+Network
+  Realtek RTL8111/8168/8211/8411 rev 15, PCI 10ec:8168, driver r8169
+  Requires the rtl_nic firmware blob
+  No wireless hardware
+
+Other
+  AMD PSP 1022:15df (ccp), AMD IOMMU, ASMedia SATA and USB bridges
+  k10temp for thermals
+
+One firmware fault is worth knowing, because it makes Secure Boot look
+like it works when it does not.  This board defaults to executing an
+image whose signature check fails, which is sbctl's quirk FQ0001 and
+affects this model from firmware 7C96v183 onward.  Enrolled keys mean
+nothing until Secure Boot Preset is set to Maximum Security in the
+setup menu, which it is.  sbctl goes on reporting the quirk, because
+it identifies it from the board name and firmware date and cannot read
+the preset, so reported state is not evidence here:
+scripts/secureboot-check.sh proves enforcement instead, by offering
+the boot menu an unsigned binary and watching it be refused.
+
+
+How It Is Built
+===============
+
+Enough of the Nix model to make the rest readable.
+
+Every build output lands in /nix/store under a path whose name begins
+with a hash of every input that produced it: sources, dependencies,
+compiler flags, build script.  Two builds with different inputs get
+different paths and coexist.  Nothing is ever installed over anything
+else, which is the whole basis of the rollback and the isolation.
+
+A NixOS system is one derivation.  Building the configuration produces
+a system closure; switching to it activates that closure and adds a
+boot entry.  The old closure is untouched, which is why the boot menu
+carries every generation, and why a wrong change costs a reboot rather
+than a repair.
+
+A substituter is a binary cache.  Before building, Nix asks the
+configured substituters whether they already have the store path for
+this exact derivation; cache.nixos.org is the default.  That is also
+the reason this configuration takes stock packages: an overridden
+package matches no cached build and is compiled here, along with
+everything downstream of it.
+
+No channels and no flakes.  A channel is a pointer to a nixpkgs
+revision that has already passed the project build farm, and it moves
+on its own; this machine has none.  nix.channel.enable is false and
+nix.nixPath points at the pin, so <nixpkgs> in nix-shell and nix repl
+resolves to the same revision the system was built from.  Flakes would
+give the one thing wanted from them, a recorded revision travelling
+with the repository, at the price of an experimental feature;
+system.nix gives it with builtins.fetchTarball and a hash.
+
+The entry point is system.nix, the mechanism added in NixOS 26.05,
+which both tools understand:
+
+  install:  nixos-install --root /mnt --file /mnt/etc/nixos/system.nix
+  rebuild:  nixos-rebuild switch --file /etc/nixos/system.nix
+
+The five pins, all in system.nix, each moved only on purpose:
+
+  nixpkgs       nixos-unstable at 494ce7f, 2026-10-05.  Unstable
+                rather than stable, because package freshness is the
+                point and stable's six-month cadence does not give it.
+                Pinning is what makes unstable comfortable: the
+                revision moves when it is moved.
+  home-manager  master at fe48612, whose release.json says 26.11, the
+                same release as the nixpkgs pin.  Only the CLI is in
+                nixpkgs, so the module is a second input.
+                home-manager warns when the two releases disagree, so
+                this pin moves when nixpkgs crosses a release.
+  disko         the v1.13.0 release commit, the same version as the
+                disko command nixpkgs packages, so disko.nix is read
+                by one disko and not two.  Its module is not in
+                nixpkgs either.
+  lanzaboote    the v1.1.0 release commit.  It left nixpkgs in 2025,
+                and its guide says to track a release.  Since 1.0.0 it
+                needs no flakes, which is what made Secure Boot
+                affordable here.
+  rust-overlay  4748ec2, handed to lanzaboote in place of the one its
+                v1.1.0 lock pins, which still writes stdenv.isLinux
+                and printed two deprecation warnings on every
+                evaluation.  Drop this pin once a lanzaboote release
+                carries the fix.
+
+Per-project dependencies do not live on this machine.  A shell.nix in
+a project directory declares what that project needs, and nix-shell
+there puts exactly those on PATH and nowhere else; the file is
+committed with the project, so the environment travels with it and
+leaves no trace beyond store paths.  That is why the package lists
+below are as short as they are.
+
+Seeing what changed between generations: NixOS keeps built closures,
+one per generation, and nothing tracks the configuration files.  A
+generation diff shows what changed in the result, not which line was
+edited; git is what records the latter.
+
+  nixos-rebuild list-generations
+  nix store diff-closures /nix/var/nix/profiles/system-N-link \
+                          /nix/var/nix/profiles/system-M-link
+
+
+The System
+==========
+
+Boot and Secure Boot            modules/boot.nix
+
+  lanzaboote replaces the systemd-boot installer with one that signs.
+  It installs the same systemd-boot, signed, and a signed image per
+  generation in EFI/Linux in place of the unsigned Type #1 entries, so
+  the menu and rollback through it carry over unchanged.  The keys
+  live in /var/lib/sbctl, and the encrypted disk is the only
+  protection they get.
+
+  No key is copied off the machine and none is kept.  The routine for
+  any install is to delete the firmware's Secure Boot variables,
+  install, and let the machine make and enrol new keys with no step by
+  hand.  autoGenerateKeys runs sbctl create-keys on a boot where
+  /var/lib/sbctl/keys does not exist; autoEnrollKeys exports them once
+  into /boot/loader/keys/auto and sets secure-boot-enroll force, which
+  systemd-boot acts on while the firmware is in Setup Mode and ignores
+  afterwards.  Microsoft's certificates are not enrolled: there are no
+  expansion cards, so no option ROM needs verifying, and the runbook
+  reads the TPM event log from the installer, before anything is
+  erased, to confirm that is still true.
+
+  The boot menu's editor is off.  NixOS leaves it on for backwards
+  compatibility and recommends false, because it gives root through
+  init=/bin/sh.  With Secure Boot enforcing lanzaboote's stub already
+  ignores an edited command line; this closes the menu side as well.
+
+  configurationLimit is 10, which caps how many generations keep a
+  kernel and a signed image on the 1 GiB ESP.  Garbage collection
+  bounds the store separately, in nix.nix, and the two are not the
+  same limit.
+
+  amd_pstate=active on the command line, amdgpu in the initrd, AMD
+  microcode updated, and hardware.enableRedistributableFirmware, which
+  pulls linux-firmware whole.  nixpkgs ships no per-vendor subset, and
+  extracting one by hand is not worth a local derivation on a 1 TB
+  disk with a deduplicated, compressed store.
+
+  No Unified Kernel Image is built separately: on the Arch system a
+  UKI existed to give Secure Boot one signable artifact, and here the
+  signed image per generation is that artifact.
+
+The disk                        disko.nix, modules/filesystems.nix
+
+  One description, two jobs.  The disko module turns disko.nix into
+  fileSystems and boot.initrd.luks.devices for the running system, and
+  the disko command reads the same file on a reinstall to erase,
+  partition, encrypt, format and mount.  Partitions are found by GPT
+  partition name under /dev/disk/by-partlabel/, not by UUID, which is
+  what lets one file describe a disk that does not exist yet.
+
+    nvme0n1p1  ESP        1 GiB     vfat, label BOOT, on /boot,
+                                    fmask and dmask 0077
+    nvme0n1p2  cryptroot  the rest  LUKS2, then btrfs labelled nixos
+
+  Subvolumes, all with noatime, compress=zstd:3, ssd, discard=async
+  and space_cache=v2:
+
+    @           /
+    @home       /home
+    @nix        /nix
+    @log        /var/log
+    @snapshots  /home/.snapshots
+
+  @nix is separate so that rolling @ back never rolls the store back
+  with it, which would leave the generation being rolled back to
+  without the paths it needs.  @log stays so a rollback does not
+  destroy the record of what went wrong before it.  @snapshots is
+  top-level rather than nested under @home, because services.snapper
+  never runs snapper create-config and so nothing else would create
+  it.
+
+  The LUKS container has no key file: a reinstall asks for the
+  passphrase at the terminal, and it is the one typed at every boot.
+  allowDiscards passes TRIM through the container, so fstrim and
+  discard=async reach the drive instead of stopping at the filesystem,
+  which on a DRAM-less budget NVMe is the case worth caring about.
+  What it costs is that somebody holding the powered-off disk learns
+  which blocks are in use; accepted on a machine that does not leave
+  the room.
+
+  On top of that: fstrim, a monthly scrub of /, the I/O scheduler set
+  to none for NVMe and bfq for anything rotational, and snapper
+  timeline snapshots of /home only.  Generations already cover
+  everything the configuration owns, atomically and with a boot entry,
+  and they never touch /home.  System rollback is a NixOS feature,
+  data rollback is a Btrfs feature, and neither is asked to do the
+  other's work.
+
+Memory and CPU                  modules/memory-cpu.nix
+
+  zram at half of RAM, zstd, priority 100, with the four reclaim
+  sysctls that belong with it: swappiness 180, watermark_boost_factor
+  0, watermark_scale_factor 125 and page-cluster 0.  Those numbers are
+  correct only because the swap device is RAM, and carrying them
+  without zram would be a mistake.  On 31 GiB this is insurance
+  against one runaway process rather than tuning; it costs nothing
+  idle, because the device allocates only what it holds.
+
+  The CPU governor is performance.
+
+  zswap is left alone.  nixpkgs compiles it in and leaves it off at
+  runtime, so the zswap.enabled=0 parameter an Arch system needs would
+  be a no-op here.
+
+Graphics and audio              modules/graphics.nix
+
+  hardware.graphics.enable and LIBVA_DRIVER_NAME=radeonsi, and that is
+  all of it.  mesa carries both radeonsi and RADV, so there is nothing
+  to add to extraPackages.  Measured in the session: OpenGL 4.6 on
+  radeonsi, Vulkan 1.4 on RADV, and VA-API decoding H264, HEVC, VP9,
+  MPEG2, VC1 and JPEG, with H264 and HEVC encode.  There is no AV1 in
+  either direction; that is the silicon, one generation short of it,
+  and no configuration can add it.
+
+  There is no audio configuration at all, deliberately.  wireplumber
+  selects the analog sink unconfigured, so the UCM workaround, the
+  card index and the unmute loop the Arch system carried all have
+  nothing to do.  Naming no card index is also what makes probe order
+  stop mattering.  pipewire itself arrives through
+  services.graphical-desktop, which programs.hyprland pulls in.
+
+The session                     modules/session.nix, home/hyprland.nix
+
+  Hyprland under uwsm, with no display manager.  The session starts
+  itself when librefos logs in on tty1, from the login shell:
+
+    if uwsm check may-start -q; then
+      exec uwsm start -e -D Hyprland hyprland.desktop
+    fi
+
+  That is upstream's own launch line.  -D names the desktop and -e
+  makes it exclusive, so XDG_CURRENT_DESKTOP is Hyprland alone, which
+  is what the portal reads to choose a backend; hyprland.desktop runs
+  start-hyprland, so a compositor crash is recovered and a crash while
+  locked comes back locked.  The nixpkgs uwsm module can express
+  neither, which is why there is no programs.uwsm.waylandCompositors
+  block; withUWSM sets programs.uwsm.enable, and everything the
+  session needs lives there.
+
+  may-start is the guard and is not optional: uwsm's environment
+  preloader sources the profile itself, so an unguarded exec can loop.
+  It passes only in a local login shell, not as root, on VT 1, with
+  graphical.target active and no graphical session already running.
+  Every other VT is a plain console, which is the way back in if the
+  session ever fails to start.
+
+  The system owns the parts of the session that are not the user's:
+  hyprlock's PAM service, foot through programs.foot, the cursor, the
+  keymap, the fonts, and the D-Bus registration gcr's prompter needs
+  in order to draw the GPG passphrase window.  The compositor's own
+  settings, the bar, the lock screen's layout and the idle rules
+  belong to the user and are in home/hyprland.nix.
+
+    foot        monospace:size=12 on black with #bbbbbb text.  The
+                sixteen ANSI colours are deliberately untouched: red
+                for an error is a value, not decoration.
+    cursor      DMZ-Black at 24, through Xcursor.  24 is a floor,
+                since DMZ is drawn at 24, 32 and 48 and Hyprland draws
+                the nearest image without scaling it.
+    keymap      us/intl, set both in services.xserver.xkb, which is
+                what gives the console its keymap, and in the
+                compositor's own input block, or dead keys stop
+                working and accented characters go with them.
+    console     Terminus at 8x16, ter-v16n, which is the kernel's own
+                cell size, so only the letterforms change.
+    fonts       terminus_font_ttf, whose family is "Terminus (TTF)",
+                first in defaultFonts.monospace with DejaVu behind it,
+                so one decision covers every client that asks for
+                monospace.  DejaVu, Liberation, Noto and the colour
+                emoji are there for the text coverage a browser and a
+                document viewer need.
+    tools       wmenu, grim, slurp, wl-clipboard, pavucontrol.  There
+                is no wallpaper daemon: there is no wallpaper, and
+                Hyprland's own is turned off rather than covered up.
+
+Shell and editors               modules/shell.nix, home/shell.nix
+
+  One prompt for every account, replacing the NixOS default, which
+  begins with a newline and so leaves a blank line after every
+  command's output.  The colour goes with it: bash's \$ already prints
+  # for root and $ for everyone else, which is the same information
+  stated rather than signalled.  The escape that sets the window title
+  stays, because the bar reads it.
+
+  Two editors: Emacs, for librefos, and GNU ed for everything else.
+  EDITOR is ed, set as a session variable, so the systemd user manager
+  and the services under it see it and not only login shells.  nano is
+  switched off, since NixOS installs it and sets EDITOR=nano
+  otherwise.  vim is not installed; the Arch vimrc is kept in
+  home/files/vimrc, verbatim and imported by nothing.
+
+  ssh-agent runs as a user service, with SSH_AUTH_SOCK exported from
+  /etc/profile before the session starts, so Hyprland and everything
+  under it find it.  Keys are still added by hand with ssh-add.
+
+Network                         modules/network.nix
+
+  The host is amd.  systemd-networkd with one .network unit for
+  enp34s0 on DHCP, systemd-resolved, and the firewall on its nftables
+  backend, already denying incoming.  NetworkManager would buy nothing
+  on a machine with no wireless hardware.  The trap to remember is
+  setting systemd.network.enable while useNetworkd is false, which
+  lets networkd and dhcpcd fight over the same interface.
+
+  America/Sao_Paulo and en_US.UTF-8.
+
+Users and privilege             modules/users.nix
+
+  One account, librefos, in wheel, plus root.  The organisation that
+  might have been separate accounts is directories under one home
+  instead: the only thing separate accounts buy over that is isolating
+  one context's compromise from another, which is not wanted here,
+  and keeping toolchains apart is already answered by per-project
+  shell.nix.
+
+  users.mutableUsers is false, so the user and group files are
+  replaced wholesale on activation and the only way to add a user or
+  change a shell is to edit this repository as root.  The consequence
+  to know: passwd stops working, and both hashes come from
+  /etc/passwords/root and /etc/passwords/librefos, which are placed by
+  hand and never committed.  Those files have to exist before the
+  first activation or nobody can log in, root included.
+
+  sudo stays, with execWheelOnly, so the binary is not executable at
+  all outside wheel.  nix.settings.trusted-users is left at its
+  default of root: a user not on that list cannot add substituters,
+  cannot import unsigned store paths, and cannot influence what the
+  daemon builds for anybody else.
+
+  What a normal user can still do is install into their own profile,
+  which changes nothing system-wide and needs no root.
+
+  home-manager is wired in here, as a NixOS module, with useGlobalPkgs
+  so it builds from this system's pkgs rather than a second nixpkgs,
+  and useUserPackages so home.packages become the user's system
+  packages instead of a nix-env profile.  There is no
+  backupFileExtension: an existing file where a link should go stops
+  activation with "would be clobbered", and that is wanted, because a
+  stray file should be looked at rather than renamed out of sight.
+
+Documentation                   modules/documentation.nix
+
+  A machine that answers its own questions offline.  man.cache.enable
+  and dev.enable both default to false and are both on here, which is
+  what makes apropos and man -k work and what puts the library pages
+  in section 3.  nixos.includeAllModules makes man 5 configuration.nix
+  cover every module this machine actually runs, not only the base
+  ones.  man-pages and man-pages-posix are the Linux and POSIX API
+  collections.
+
+  So: man for the system and the APIs, info for the GNU tools, man 5
+  configuration.nix for every option set here, nixos-help for the
+  manual, nixos-option to query a live value, and apropos to find any
+  of them without knowing the name first.
+
+Nix itself                      modules/nix.nix
+
+  nix-command is on, for the newer CLI; flakes are not.  Garbage
+  collection runs weekly and deletes generations older than 30 days,
+  and store optimisation runs weekly beside it.  The tension is worth
+  restating: generations are the rollback mechanism and garbage
+  collection deletes them, so that window is the safety net being
+  sized.  Revisit it with real data on how fast the store grows here.
+
+Packages                        modules/packages.nix
+
+  Stock, unpatched, and only what the workflow names.  Anything with a
+  NixOS or home-manager module is enabled through that module instead,
+  because that is also where it is configured.  What is left with no
+  module of its own:
+
+    tmux                on its own defaults, no configuration at all
+    sbctl               makes, verifies and enrols the Secure Boot keys
+    wireguard-tools     wg and wg-quick for the tunnel to the vps,
+                        which is configured by hand in /etc/wireguard
+                        so its keys never enter this repository
+    curl wget file tree ripgrep htop
+
+Compatibility                   modules/compat.nix
+
+  nix-ld.  NixOS has no Filesystem Hierarchy Standard, so a prebuilt
+  binary compiled for a generic glibc Linux and hardcoding
+  /lib64/ld-linux-x86-64.so.2 as its interpreter fails to start here.
+  nix-ld installs a stub at that path, resolving against the libraries
+  listed in libraries instead.  Hit first through pnpm, which fetches a
+  native binary of itself the same way; the fix is general and will
+  cover the next tool that does this too.
+
+The User Half
+=============
+
+home/, built by home-manager as part of the system and never on its
+own: modules/users.nix imports it as home-manager.users.librefos, so
+nixos-rebuild builds it with the rest and a bad generation rolls back
+from the boot menu like any other.
+
+  bash        history controls, the ls and grep aliases, set -o vi.
+              The prompt, EDITOR and the SSH agent are the system's,
+              above, and are not restated here.
+  git         name, email, send-email through ssh-sendmail, and
+              commits and tags signed by default.
+  GnuPG       the agent with pinentry-gnome3, so the passphrase is
+              asked for in a window and every caller gets the same
+              prompt: git in a terminal, Emacs, and git started from
+              Emacs.  A curses pinentry has to be told which terminal
+              to draw in, and a program started from the session has
+              none.  The window is drawn by gcr's prompter, which
+              modules/session.nix registers with D-Bus.
+  Emacs       emacs-pgtk, the pure GTK build, native on Wayland, which
+              already is everything the Arch emacs-git PKGBUILD asked
+              for.  Gnus reads ~/.gnus.el and nothing else, so that
+              stays a file.
+  Firefox     the dev-edition-default profile: 172 preferences and
+              no stylesheet.  Developer Edition itself and the
+              enterprise policies are the system's, in
+              modules/firefox.nix, because programs.firefox there
+              writes /etc/firefox/policies/policies.json.  The tab
+              strip is Firefox's own, at the top and unstyled; the
+              theme is the built-in compact dark one.  uBlock Origin is
+              installed by policy on the first run, with its button in
+              the nav bar.
+  Hyprland    the compositor's settings in Lua, the waybar bar, the
+              hyprlock lock screen and the hypridle rules.  Idle locks
+              the session after five minutes and turns the monitor off
+              half a minute later; a manual lock runs loginctl
+              lock-session, so it takes the same path as the timeout
+              and as sleep.  The bar and the wmenu launcher are one
+              strip: Terminus at 12 pixels in both, written as 12px on
+              each side so neither goes through a point size, and the
+              bar's height is the 16 pixels wmenu computes for itself,
+              so the launcher covers the bar rather than sitting above
+              it with its text a few pixels off.
+
+Two files stay files, because no option expresses their content:
+gnus.el and ssh-sendmail, which is a script and is
+installed through writeScriptBin so it is on PATH without adding a
+directory to it.  vimrc is kept and imported by nothing.
+
+
+Conventions
+===========
+
+Options over files.  Where NixOS or home-manager has an option for
+something, the option is used; a file is kept only where no option can
+express the content.  A NixOS module is preferred to a home-manager
+one when the program reads /etc, because then there is one statement
+for the machine rather than one per user.
+
+Stock packages.  No overlay and no patches.  Everything is what the
+binary cache already has, which is also what keeps a rebuild to a
+download.  An overlay remains the mechanism for the first package that
+genuinely needs one, and nothing here makes adding it harder.
+
+Values over visuals.  Nothing on screen has to be decoded before it
+can be read.  The bar is words and numbers, not icons; the palette is
+black, grey and white; there are no gaps, rounding, blur, shadows,
+animations, wallpaper or window borders.  The exception is deliberate:
+the terminal's ANSI colours are left alone, because a program printing
+red is saying something.
+
+Defaults are learned rather than overridden.  The keybindings are
+Hyprland's own, not habits carried in from another window manager.
+
+Nothing secret is committed.  The password hashes, the GPG secret key,
+~/.authinfo.gpg, the SSH keys and the WireGuard tunnel are all placed
+by hand and listed under By hand.
+
+Comments cite what they were read from, and option names are checked
+against the revisions system.nix pins rather than against memory.
+
+
+Installing and Changing
+=======================
+
+install-runbook.md is the procedure; the scripts only save the typing,
+and each stops with STOP: at the first thing that is not as expected.
+
+  scripts/reinstall.sh          runbook steps 2 to 10, in the NixOS
+                                minimal installer, from the copy of
+                                this repository unpacked in step 1.
+                                It checks sbctl's option-ROM condition
+                                before anything is erased, runs disko,
+                                installs, and leaves only disko's
+                                question, the LUKS passphrase and the
+                                two passwords to the user.  It never
+                                reboots.
+  scripts/secureboot-check.sh   after a reinstall, in two runs around
+                                one reboot: it reads the enforcing
+                                state and then proves it, by writing a
+                                boot entry that points at the unsigned
+                                kernel and watching the firmware
+                                refuse it.  The entry is removed
+                                straight after.
+  scripts/apply.sh              a new commit onto the running system.
+                                Every .nix file parses, the new
+                                configuration evaluates in a staging
+                                copy beside this machine's own
+                                hardware-configuration.nix, and
+                                nixos-rebuild dry-build says what
+                                would be downloaded and what would be
+                                compiled.  Nothing changes until that
+                                has been read and answered yes; then
+                                the previous /etc/nixos is saved to
+                                /root/etc-nixos.before-apply and the
+                                switch runs.
+
+The repository reaches the machine one of two ways, neither of them a
+public paste: as a git archive of a commit on the Ventoy stick the
+installer boots from, or, once the machine is running, cloned from the
+git server on the vps over the WireGuard tunnel.  Both carry only
+committed files.
+
+Anything touching the mounts or the initrd is worth evaluating before
+it is built, which costs two commands and no reboot:
+
+  nix-instantiate --eval --strict --json /etc/nixos/system.nix \
+    -A config.fileSystems
+  nix-instantiate --eval --strict --json /etc/nixos/system.nix \
+    -A config.boot.initrd.luks.devices
+
+By hand, after any install:
+
+  /etc/passwords/root and /etc/passwords/librefos, written from
+  mkpasswd before the first activation, the directory 700 and the
+  files 600.  The runbook types each password a second time against
+  the salt in its file, because mkpasswd asks once and never confirms,
+  and with mutableUsers false a silent typo locks both accounts at
+  once.  It is recoverable from the installer with nixos-enter.
+  The GPG secret key, and ~/.authinfo.gpg.
+  The SSH keys and ~/.ssh/config, with its vps host.  ssh-add once per
+  session.
+  The WireGuard tunnel in /etc/wireguard.
+
+Secure Boot needs nothing by hand: the firmware's Secure Boot
+variables are deleted before installing, and the machine makes and
+enrols its own keys over the first two boots.
+
+
+Deliberately Absent
+===================
+
+Each of these was decided rather than forgotten.
+
+  TPM auto-unlock.  The mechanism transfers and the machine has the
+  chip, but sealing to PCR 7 is only honest while Secure Boot
+  enforces, and a passphrase at boot is strictly stronger than the
+  alternative it would replace.  Deferred, not rejected; revisit if
+  the machine ever leaves the room, alongside the disposal case that
+  justifies LUKS here.
+
+  Impermanence.  Adopted and then removed, after two of its four steps
+  had run.  NixOS has no built-in way to wipe the root, so on Btrfs
+  the wipe is hand-written code in the boot path, rewritten here for
+  systemd stage 1, which is the kind of unofficial workaround this
+  configuration does not carry.  The declarative alternative, / on
+  tmpfs, was rejected on its own terms.  What it would have solved,
+  undeclared state accumulating where nobody is looking, is real but
+  is not what this migration was for; the subvolume layout stays
+  compatible with it, so adopting it later is a configuration change
+  and not a reinstall.
+
+  An overlay.  It turned out empty.  emacs-pgtk already is what the
+  Arch emacs-git PKGBUILD asked for, and llama-cpp's override exists
+  as the packaged llama-cpp-vulkan, which dispatches on the CPU at
+  runtime instead of being built with -march=native.
+
+  nixos-hardware.  Per-model profiles, and there is no A520M-A PRO
+  profile; the generic AMD pieces it would supply are the one or two
+  options already written here.
+
+  An X11 session.  Wayland, with no second session kept to retreat
+  into.  XWayland is switched off at runtime, in the compositor
+  settings, rather than through programs.hyprland.xwayland.enable,
+  which would override the package with a variant nobody else builds
+  and so compile Hyprland here on every pin move.
+
+  UFW, reflector, mkinitcpio, genfstab, and a package-cache subvolume.
+  Each has either no equivalent or no need: the firewall is a module,
+  substituters replace mirrors, stage 1 is systemd by default, the
+  mounts come from disko.nix, and there is no pacman cache to keep out
+  of snapshots.
+
+  A natively tuned build.  -march=native would defeat substitution:
+  every store path would miss the binary cache and the machine would
+  compile the world, which is the same trade on any distribution.
+
+
+Open
+====
+
+None of it blocking.
+
+  The rust-overlay pin, to be dropped once a lanzaboote release
+  carries the stdenv fix it exists for.
+
+  Moving the pins.  It is an ordinary apply: edit the URLs and hashes
+  in system.nix, dry-build, switch.  Hyprland's configuration syntax
+  moves across minor releases, so a pin move is likeliest to need work
+  there; the configuration is already Lua, which is what 0.57 wants.
+
+  AV1, absent in this hardware's video engine.  Whether to care is a
+  question about what this machine plays, not one Nix can answer.
+
+  The laptop, the intel profile, out of scope until now.
+
+
+References
+==========
+
+  https://nixos.org/manual/nixos/stable/         NixOS manual
+  https://nixos.org/manual/nixos/stable/options  option search
+  https://search.nixos.org/packages              package search
+  https://github.com/nix-community/home-manager
+  https://github.com/nix-community/disko
+  https://github.com/nix-community/lanzaboote    Secure Boot
+  https://wiki.nixos.org/                        community wiki
+
+  On the machine: nixos-help, man 5 configuration.nix for the option
+  reference of the running system, and nixos-option to read a live
+  value.

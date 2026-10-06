@@ -1,0 +1,27 @@
+unlet! skip_defaults_vim
+source $VIMRUNTIME/defaults.vim
+filetype plugin indent on
+runtime ftplugin/man.vim
+
+let g:netrw_banner = 0
+let g:netrw_liststyle = 3
+let g:netrw_browse_split = 4
+let g:netrw_list_hide = '.*\.swp$'
+let g:netrw_browsex_viewer = 'firefox-devedition'
+
+augroup SetIndentation
+  autocmd!
+  autocmd FileType c,cpp setlocal et sw=2 sts=2 ts=8 tw=79 cc=80 cin
+  autocmd FileType python,php,java setlocal et sw=4 sts=4 ts=8 tw=79 cc=80
+  autocmd FileType sh,javascript,html,tex setlocal et sw=2 sts=2 ts=8 tw=79 cc=80
+augroup END
+
+" Restore cursor position
+autocmd BufReadPost *
+  \ if line("'\"") > 1 && line("'\"") <= line("$") |
+  \   exe "normal! g`\"" |
+  \ endif
+
+set nocompatible encoding=utf-8 cursorline background=dark
+set nowrap ignorecase smartcase incsearch undofile undodir=~/.vim/undodir
+colorscheme quiet

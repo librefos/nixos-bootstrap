@@ -1,0 +1,36 @@
+#!/bin/sh
+set -u
+
+# ssh-sendmail - relay a message to the VPS MTA (postfix) over SSH.
+
+readonly VPS_HOST='vps'	# ~/.ssh/config
+readonly REMOTE_SENDMAIL='/usr/sbin/sendmail'
+readonly LOG="${XDG_STATE_HOME:-$HOME/.local/state}/ssh-sendmail.log"
+
+log()
+{
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+  msg='ERROR no SSH_AUTH_SOCK; start one with `eval "$(ssh-agent -s)" && ssh-add <key>` before sending'
+  log "$msg"
+  printf 'ssh-sendmail: %s\n' "$msg" >&2
+  exit 78	# EX_CONFIG
+fi
+
+ssh -o BatchMode=yes \
+    -o ConnectTimeout=15 \
+    -o ServerAliveInterval=10 \
+    -o ServerAliveCountMax=3 \
+    "$VPS_HOST" -- "$REMOTE_SENDMAIL" "$@"
+status="$?"
+
+if [ "$status" -ne 0 ]; then
+  log "ERROR ssh exit=$status args=[$*]"
+  printf 'ssh-sendmail: relay to "%s" failed (ssh exit %s); message NOT sent. See %s.\n' \
+    "$VPS_HOST" "$status" "$LOG" >&2
+fi
+
+exit "$status"
